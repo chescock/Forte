@@ -1,0 +1,13 @@
+[package]
+name = "forte"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+parking_lot = "0.12.3"
+async-task = "4.7.1"
+crossbeam-utils = "0.8.21"
+crossbeam-deque = "0.8.6"
+
+[dev-dependencies]
+winit = "0.30.7"
