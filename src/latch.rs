@@ -250,11 +250,9 @@ impl<'r> Latch for RegistryLatch<'r> {
         //
         // To prevent that from happening, we clone the `Cow` before using it.
         // When owned, this has the effect of cloning the arc, ensuring that the
-        // registry will not be dropped. When owned, this is as cheap as an
-        // additional borrow.
-        //
-        // Incidentally, the registry cannot be dropped if we are holding a
-        // `Cow::Borrowed` because of the lifetime requirement.
+        // registry will not be dropped. When borrowed, this is as cheap as an
+        // additional borrow, and we know the registry cannot be dropped because
+        // of the lifetime requirement.
         //
         // Therefore the reference `&registry` must be valid until the end of
         // this block.
@@ -322,7 +320,7 @@ impl Latch for LockLatch {
     unsafe fn set(this: *const Self) {
         // SAFETY: We assume the pointer is valid when passed in. Side-effects
         // are not transmitted until the `notify_all` call at the very end, so
-        // it is fine if the pointer becomes dangling.
+        // the pointer remains valid for the entire block.
         unsafe {
             let mut guard = (*this).mutex.lock();
             *guard = true;
