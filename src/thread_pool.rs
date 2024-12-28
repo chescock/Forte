@@ -307,9 +307,7 @@ impl Registry {
                 // to the result.
                 result = Some(f(worker_thread, true));
 
-                // SAFETY: This job is valid for the duration of the scope, and
-                // the scope will not complete until the latch is set because of
-                // the call to `wait_and_reset`.
+                // SAFETY: This latch is static, so the pointer is always valid.
                 unsafe { Latch::set(latch) };
             });
 
