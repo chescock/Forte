@@ -145,8 +145,9 @@ impl Drop for ThreadPool {
 pub struct Registry {
     /// Immutable data about each worker thread.
     threads: Vec<ThreadInfo>,
-    /// Global mutable shared state, locked behind a mutex. We must ensure this
-    /// mutex stays under extremely low contention.
+    /// The global job injector queue. This is a queue of pending jobs that can
+    /// be taken by any thread. It uses the lock-free injector queue
+    /// implementation from crossbeam.
     queue: Injector<JobRef>,
     /// Holds prevent the registry from terminating.
     hold_count: CachePadded<AtomicUsize>,
@@ -164,8 +165,8 @@ struct ThreadInfo {
     /// they are busy. This is typically the last (oldest) job on their queue.
     ///
     /// To reduce global lock contention, these shared jobs are stored behind
-    /// individual mutex lock. Like the global state mutex, we should try to
-    /// keep contention on the shared job locks as low as possible.
+    /// individual mutex lock. We should try to keep contention on the shared
+    /// job locks as low as possible.
     shared_job: CachePadded<Mutex<Option<SharedJob>>>,
     /// Blocking synchronization data for the thread.
     sleep_state: CachePadded<SleepState>,
@@ -858,8 +859,6 @@ impl WorkerThread {
     /// Pops a job off the local queue and promotes it to a shared job. If the
     /// local job queue is empty, this does nothing. If the worker has an
     /// existing shared job, it increment that job's age.
-    ///
-    /// This does not lock the global registry state.
     #[cold]
     fn promote(&self) {
         // SAFETY: The job queue reference is not returned, and `job_queue` is

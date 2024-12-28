@@ -21,8 +21,8 @@
 //! # Safety
 //!
 //! Latches are an inherently somewhat unsafe construct, because once a latch is
-//! becomes "open", the logic is unblocks often deallocates the lock. Refer to
-//! specific saftey comments for more information.
+//! becomes "open", the logic it unblocks often deallocates the lock. Refer to
+//! specific safety comments for more information.
 
 use std::{
     borrow::Cow,
@@ -240,7 +240,7 @@ impl<'r> RegistryLatch<'r> {
 impl<'r> Latch for RegistryLatch<'r> {
     #[inline]
     unsafe fn set(this: *const Self) {
-        // SAFETY: We assme the pointer is valid when passed in.
+        // SAFETY: We assume the pointer is valid when passed in.
         //
         // It's possible that the pointer will become dangling during the call
         // to `set_and_wake`. If that happens, then our local `registry` field
@@ -320,7 +320,7 @@ impl Default for LockLatch {
 impl Latch for LockLatch {
     #[inline]
     unsafe fn set(this: *const Self) {
-        // SAFETY: We assme the pointer is valid when passed in. Side-effects
+        // SAFETY: We assume the pointer is valid when passed in. Side-effects
         // are not transmitted until the `notify_all` call at the very end, so
         // it is fine if the pointer becomes dangling.
         unsafe {
@@ -368,7 +368,7 @@ impl CountLatch {
 impl Latch for CountLatch {
     #[inline]
     unsafe fn set(this: *const Self) {
-        // SAFETY: We assme the pointer is valid when passed in. Side-effects
+        // SAFETY: We assume the pointer is valid when passed in. Side-effects
         // are not transmitted until the `Latch::set` call at the very end, so
         // it is fine if the pointer becomes dangling.
         unsafe {

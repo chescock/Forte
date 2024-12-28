@@ -141,7 +141,8 @@ where
     /// # Safety
     ///
     /// Caller must ensure the `StackJob` remains valid until the `JobRef` is
-    /// executed.
+    /// executed. This amounts to ensuring the job is executed before the stack
+    /// frame is popped.
     pub unsafe fn as_job_ref(&self) -> JobRef {
         JobRef::new(self)
     }
@@ -155,7 +156,9 @@ where
     ///
     /// # Safety
     ///
-    /// Caller must ensure that the pointer points to a valid `StackJob`.
+    /// Caller must ensure that the pointer points to a valid `StackJob`; or,
+    /// equivalently, that this is called before the stack frame in which the
+    /// job is allocated is popped.
     unsafe fn execute(this: *const ()) {
         let this = &*(this as *const Self);
         let job = (*this.job.get()).take().unwrap();

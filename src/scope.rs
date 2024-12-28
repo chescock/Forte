@@ -76,7 +76,7 @@ impl<'scope> Scope<'scope> {
         F: FnOnce(&Scope<'scope>) + Send + 'scope,
     {
         // We increment the scope counter; this will prevent the scope from
-        // ending until after a coresponding `Latch::set` call.
+        // ending until after a corresponding `Latch::set` call.
         self.job_completed_latch.increment();
 
         // Create a job to execute the spawned function in the scope.
@@ -94,10 +94,10 @@ impl<'scope> Scope<'scope> {
 
         // SAFETY: The heap job does not outlive `'scope`. This is ensured
         // because the owner of this scope is required to call
-        // `Scope::complete`, and function keeps the scope alive until the latch
-        // is opened. The latch will not open until after this job is executed,
-        // because the call to `increment` above is matched by the call to
-        // `Latch::set` after execution.
+        // `Scope::complete`, and that function keeps the scope alive until the
+        // latch is opened. The latch will not open until after this job is
+        // executed, because the call to `increment` above is matched by the
+        // call to `Latch::set` after execution.
         let job_ref = unsafe { job.into_job_ref() };
 
         // Send the job to a queue to be executed.
