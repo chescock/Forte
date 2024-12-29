@@ -65,6 +65,10 @@ impl JobRef {
         JobRef { pointer }
     }
 
+    pub fn into_raw(self) -> *const Job {
+        self.pointer
+    }
+
     pub fn from_runnable(runnable: Runnable) -> Self {
         let ptr = runnable.into_raw().as_ptr() as usize;
         debug_assert!(
