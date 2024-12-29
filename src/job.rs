@@ -12,34 +12,46 @@
 //! (b) The job remains valid until it is executed for the last time.
 //! (c) Each job reference is executed exactly once.
 
-use std::cell::UnsafeCell;
+use std::{cell::UnsafeCell, mem::offset_of, ptr::NonNull};
+
+use async_task::Runnable;
 
 // -----------------------------------------------------------------------------
 // Job
 
 /// A job is a unit of work that may be executed by a worker thread.
-pub trait Job {
+/// This struct should be embedded in a structure that acts as a job
+/// so that we can pass around a pointer to a common type.
+// Ensure that the struct is sufficiently aligned that we can use the bottom bit as a tag.
+// This will generally not have any effect, as function pointers will already be more aligned than this.
+#[repr(align(2))]
+pub struct Job {
     /// Calling this function runs the job.
+    execute_fn: unsafe fn(*const Job),
+}
+
+impl Job {
+    /// Creates a `Job` structure.
     ///
     /// # Safety
     ///
     /// This may be called from a different thread than the one which scheduled
-    /// the job, so the implementer must ensure the appropriate traits are met,
+    /// the job, so the caller must ensure the appropriate traits are met,
     /// whether `Send`, `Sync`, or both.
-    unsafe fn execute(this: *const ());
+    unsafe fn new(execute_fn: unsafe fn(*const Job)) -> Self {
+        Self { execute_fn }
+    }
 }
 
 // -----------------------------------------------------------------------------
 // JobRef
 
-/// Effectively a Job trait object. It can be treated as such, even though
-/// sometimes a `JobRef` will not point to a type that implements `Job`.
+/// A pointer-sized value that represents a job that can be executed.
 pub struct JobRef {
-    /// A raw pointer to data that can be executed with the `execute_fn`. This
-    /// will usually point to either a `StackJob` or a `HeapJob`.
-    pointer: *const (),
-    /// A function pointer that can execute the job stored at `pointer`.
-    execute_fn: unsafe fn(*const ()),
+    /// A tagged pointer.
+    /// If the bottom bit is clear, this is a pointer to a `Job` value embedded in a larger structure.
+    /// If the bottom bit is set, this is actually a pointer to a `Runnable` value.
+    pointer: *const Job,
 }
 
 impl JobRef {
@@ -49,28 +61,18 @@ impl JobRef {
     ///
     /// Caller must ensure `job` will remain valid until the job is executed,
     /// and that the job is executed to completion exactly once.
-    pub unsafe fn new<J>(job: *const J) -> JobRef
-    where
-        J: Job,
-    {
-        JobRef {
-            pointer: job as *const (),
-            execute_fn: <J as Job>::execute,
-        }
+    pub unsafe fn from_job(pointer: *const Job) -> Self {
+        JobRef { pointer }
     }
 
-    /// Creates a new `JobRef` from raw pointers.
-    ///
-    /// # Safety
-    ///
-    /// Caller must ensure the data at the pointer will remain valid until the
-    /// job is executed, and that the job is executed to completion exactly
-    /// once. Additionally the caller must ensure that `execute_fn` can be
-    /// called on `pointer`.
-    pub unsafe fn new_raw(pointer: *const (), execute_fn: unsafe fn(*const ())) -> JobRef {
+    pub fn from_runnable(runnable: Runnable) -> Self {
+        let ptr = runnable.into_raw().as_ptr() as usize;
+        debug_assert!(
+            (ptr & 1) == 0,
+            "Runnables must be sufficiently aligned to store a tag bit"
+        );
         JobRef {
-            pointer,
-            execute_fn,
+            pointer: (ptr | 1) as *const Job,
         }
     }
 
@@ -78,7 +80,7 @@ impl JobRef {
     /// `JobRef` itself `Copy + Eq`.
     #[inline]
     pub fn id(&self) -> impl Eq {
-        (self.pointer, self.execute_fn)
+        self.pointer
     }
 
     /// Executes a `JobRef`.
@@ -88,7 +90,21 @@ impl JobRef {
     /// Caller must ensure that `JobRef::pointer` is still valid.
     #[inline]
     pub unsafe fn execute(self) {
-        (self.execute_fn)(self.pointer)
+        if self.pointer as usize & 1 == 0 {
+            // The bottom bit was clear, so this was created by `from_job`
+            // and points to a `Job` that may be executed.
+            let execute_fn = (*self.pointer).execute_fn;
+            execute_fn(self.pointer);
+        } else {
+            // The bottom bit was set, so this was created by `from_runnable`.
+            // Clear the bit to recover the pointer returned by `Runnable::into_raw()`.
+            // SAFETY: We provide a pointer to a non-null runnable, and we turn
+            // it back into a non-null runnable. The runnable will remain valid
+            // until the task is run.
+            let ptr = NonNull::new_unchecked((self.pointer as usize & !1) as *mut ());
+            let runnable = Runnable::<()>::from_raw(ptr);
+            runnable.run();
+        }
     }
 }
 
@@ -111,7 +127,8 @@ pub struct StackJob<F>
 where
     F: FnOnce() + Send,
 {
-    job: UnsafeCell<Option<F>>,
+    job: Job,
+    f: UnsafeCell<Option<F>>,
 }
 
 impl<F> StackJob<F>
@@ -119,9 +136,10 @@ where
     F: FnOnce() + Send,
 {
     /// Creates a new `StackJob` and returns it directly.
-    pub fn new(job: F) -> StackJob<F> {
+    pub fn new(f: F) -> StackJob<F> {
         StackJob {
-            job: UnsafeCell::new(Some(job)),
+            job: unsafe { Job::new(Self::execute) },
+            f: UnsafeCell::new(Some(f)),
         }
     }
 
@@ -132,7 +150,7 @@ where
     /// This is used in `join` to run the job syncrhonously after failing to
     /// share it.
     pub fn run_inline(self) {
-        let job = self.job.into_inner().unwrap();
+        let job = self.f.into_inner().unwrap();
         job();
     }
 
@@ -144,24 +162,21 @@ where
     /// executed. This amounts to ensuring the job is executed before the stack
     /// frame is popped.
     pub unsafe fn as_job_ref(&self) -> JobRef {
-        JobRef::new(self)
+        JobRef::from_job(&self.job)
     }
-}
 
-impl<F> Job for StackJob<F>
-where
-    F: FnOnce() + Send,
-{
     /// Executes a `StackJob` from a const pointer.
     ///
     /// # Safety
     ///
-    /// Caller must ensure that the pointer points to a valid `StackJob`; or,
+    /// Caller must ensure that the pointer points to the `Job` embedded in a valid `StackJob`; or,
     /// equivalently, that this is called before the stack frame in which the
     /// job is allocated is popped.
-    unsafe fn execute(this: *const ()) {
-        let this = &*(this as *const Self);
-        let job = (*this.job.get()).take().unwrap();
+    unsafe fn execute(job: *const Job) {
+        let this = &*(job
+            .byte_offset(-(offset_of!(Self, job) as isize))
+            .cast::<Self>());
+        let job = (*this.f.get()).take().unwrap();
         job();
     }
 }
@@ -174,7 +189,8 @@ pub struct HeapJob<F>
 where
     F: FnOnce() + Send,
 {
-    job: F,
+    job: Job,
+    f: F,
 }
 
 impl<F> HeapJob<F>
@@ -182,8 +198,9 @@ where
     F: FnOnce() + Send,
 {
     /// Allocates a new `HeapJob` on the heap.
-    pub fn new(job: F) -> Box<HeapJob<F>> {
-        Box::new(HeapJob { job })
+    pub fn new(f: F) -> Box<HeapJob<F>> {
+        let job = unsafe { Job::new(Self::execute) };
+        Box::new(HeapJob { job, f })
     }
 
     /// A version of `into_job_ref` that is safe because of the static lifetime.
@@ -205,21 +222,20 @@ where
     /// is executed. This hides all lifetimes, so the caller must ensure that it
     /// dosn't outlive any data it closes over.
     pub unsafe fn into_job_ref(self: Box<Self>) -> JobRef {
-        JobRef::new(Box::into_raw(self))
+        JobRef::from_job(&raw const (*Box::into_raw(self)).job)
     }
-}
 
-impl<F> Job for HeapJob<F>
-where
-    F: FnOnce() + Send,
-{
     /// Executes a `HeapJob` from a const pointer.
     ///
     /// # Safety
     ///
-    /// Caller must ensure that the pointer points to a valid `HeapJob`.
-    unsafe fn execute(this: *const ()) {
-        let this = Box::from_raw(this as *mut Self);
-        (this.job)();
+    /// Caller must ensure that the pointer points to the `Job` embedded in a valid `HeapJob`.
+    unsafe fn execute(job: *const Job) {
+        let this = job
+            .byte_offset(-(offset_of!(Self, job) as isize))
+            .cast::<Self>()
+            .cast_mut();
+        let this = Box::from_raw(this);
+        (this.f)();
     }
 }

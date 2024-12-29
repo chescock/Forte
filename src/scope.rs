@@ -1,4 +1,4 @@
-use std::{future::Future, marker::PhantomData, ptr::NonNull, sync::Arc};
+use std::{future::Future, marker::PhantomData, sync::Arc};
 
 use async_task::{Runnable, Task};
 
@@ -177,18 +177,8 @@ impl<'scope> Scope<'scope> {
             // SAFETY: We provide a pointer to a non-null runnable, and we turn
             // it back into a non-null runnable. The runnable will remain valid
             // until the task is run.
-            let job_ref = unsafe {
-                JobRef::new_raw(
-                    runnable.into_raw().as_ptr(),
-                    |this| {
-                        let this = NonNull::new_unchecked(this as *mut ());
-                        let runnable = Runnable::<()>::from_raw(this);
-                        // Poll the task.
-                        runnable.run();
-                    }
-                )
-            };
-            
+            let job_ref = JobRef::from_runnable(runnable);
+
             // Send this job off to be executed. When this schedule function is
             // called on a worker thread this re-schedules it onto the worker's
             // local queue, which will generally cause tasks to stick to the
