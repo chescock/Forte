@@ -27,6 +27,7 @@ pub mod latch;
 pub mod scope;
 pub mod thread_pool;
 
+mod option_mutex;
 mod util;
 
 pub mod prelude {

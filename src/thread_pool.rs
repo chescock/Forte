@@ -2,13 +2,14 @@ use std::{
     cell::{Cell, UnsafeCell},
     collections::VecDeque,
     future::Future,
-    mem,
     num::NonZero,
-    ops::{Deref, DerefMut},
+    ops::Deref,
     pin::Pin,
     ptr::{self, NonNull},
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        Arc,
+    },
     task::{Context, Poll},
     thread::{self, JoinHandle},
     time::Duration,
@@ -22,6 +23,7 @@ use parking_lot::{Condvar, Mutex};
 use crate::{
     job::{HeapJob, JobRef, StackJob},
     latch::{AtomicLatch, Latch, LockLatch, Probe, RegistryLatch, SetOnWake, WakeLatch, WakeProbe},
+    option_mutex::OptionMutex,
     scope::*,
     util::CallOnDrop,
 };
@@ -167,7 +169,7 @@ struct ThreadInfo {
     /// To reduce global lock contention, these shared jobs are stored behind
     /// individual mutex lock. We should try to keep contention on the shared
     /// job locks as low as possible.
-    shared_job: CachePadded<Mutex<Option<SharedJob>>>,
+    shared_job: CachePadded<SharedJob>,
     /// Blocking synchronization data for the thread.
     sleep_state: CachePadded<SleepState>,
     /// A latch that terminates the worker thread when set.
@@ -184,13 +186,14 @@ struct SleepState {
 
 /// This represents a job that may be claimed by any worker, but currently is
 /// assigned to a specific worker.
+#[derive(Default)]
 struct SharedJob {
     /// When a shared job is created, this number is set to zero and increments
     /// each time a worker receives a heartbeat. This allows workers to
     /// prioritize older jobs when looking for shared jobs to claim.
-    age: u64,
+    age: AtomicU64,
     /// The reference to the job.
-    job_ref: JobRef,
+    job_ref: OptionMutex<JobRef>,
 }
 
 // -----------------------------------------------------------------------------
@@ -434,7 +437,7 @@ impl ThreadInfo {
     fn new(index: usize) -> ThreadInfo {
         ThreadInfo {
             heartbeat: CachePadded::new(AtomicBool::new(false)),
-            shared_job: CachePadded::new(Mutex::new(None)),
+            shared_job: CachePadded::new(SharedJob::default()),
             sleep_state: CachePadded::new(SleepState {
                 is_blocked: Mutex::new(false),
                 should_wake: Condvar::new(),
@@ -806,52 +809,49 @@ impl WorkerThread {
     #[inline]
     pub fn claim_shared(&self) -> Option<JobRef> {
         // Try to reclaim this worker's own shared job first.
-        if let Some(shared_job) = mem::take(self.thread_info().shared_job.lock().deref_mut()) {
-            return Some(shared_job.job_ref);
+        if let Some(job_ref) = self.thread_info().shared_job.job_ref.take() {
+            return Some(job_ref);
         }
 
-        // If that doesn't work, we will try to find the oldest job shared by a
-        // different worker and claim that. We will store a lock on the oldest
-        // job we have found along with it's age.
-        let mut candidate_job_lock = None;
-        // Shared job age starts at 1, so setting this to 0 initially means we
-        // will take the first job we find.
-        let mut candidate_age = 0;
+        loop {
+            // If that doesn't work, we will try to find the oldest job shared by a
+            // different worker and claim that. We will store a reference to the oldest
+            // job we have found along with it's age.
+            let mut candidate_job = None;
+            // Shared job age starts at 1, so setting this to 0 initially means we
+            // will take the first job we find.
+            let mut candidate_age = 0;
 
-        // We will iterate over all threads in index order, starting with the
-        // next thread. We do this as an alternative to starting with thread 0
-        // to reduce lock contention in the event that multiple threads wake
-        // simultaneously.
-        let current_thread = self.index();
-        let num_threads = self.registry.num_threads();
-        for i in 0..num_threads {
-            let i = (current_thread + 1 + i) % num_threads;
-            let thread = &self.registry.threads[i];
+            // We will iterate over all threads in index order, starting with the
+            // next thread. We do this as an alternative to starting with thread 0
+            // to reduce lock contention in the event that multiple threads wake
+            // simultaneously.
+            let current_thread = self.index();
+            let num_threads = self.registry.num_threads();
+            for i in 0..num_threads {
+                let i = (current_thread + 1 + i) % num_threads;
+                let new_job = &*self.registry.threads[i].shared_job;
 
-            // Now we will try to acquire a lock on the next shared job. At this
-            // point, it's possible we already hold a lock on another shared job
-            // (the candidate). To avoid deadlocks, we will simply skip shared
-            // jobs that are already locked.
-            if let Some(new_job_lock) = thread.shared_job.try_lock() {
-                // Promote the new job to the candidate if it's older.
-                if let Some(new_job) = new_job_lock.deref() {
-                    if new_job.age > candidate_age {
-                        candidate_age = new_job.age;
-                        // This releases the lock on the previous best job and
-                        // replaces it with the lock on the new best job.
-                        candidate_job_lock = Some(new_job_lock);
-                    }
+                // Promote the new job to the candidate if it's older and has a job.
+                // We use `is_unlocked_some` to check without performing any writes to shared memory.
+                // This means it may get claimed by another thread before we decide to take it.
+                let new_age = new_job.age.load(Ordering::Relaxed);
+                if new_age > candidate_age && new_job.job_ref.is_unlocked_some(Ordering::Relaxed) {
+                    candidate_age = new_age;
+                    candidate_job = Some(&new_job.job_ref);
                 }
             }
-        }
 
-        // If we have a locked job candidate, take it.
-        if let Some(mut job_lock) = candidate_job_lock {
-            let shared = mem::take(job_lock.deref_mut());
-            return Some(shared.unwrap().job_ref);
-        }
+            // Stop if we found nothing to claim.
+            let candidate_job = candidate_job?;
 
-        None
+            // Try to take the job.
+            // If another thread claimed the job after we checked,
+            // this will fail and we'll loop.
+            if let Some(job_ref) = candidate_job.take() {
+                return Some(job_ref);
+            }
+        }
     }
 
     /// Pops a job off the local queue and promotes it to a shared job. If the
@@ -866,17 +866,15 @@ impl WorkerThread {
             return;
         }
         // Acquire the lock on the shared job
-        let mut shared_job_lock = self.thread_info().shared_job.lock();
-        if let Some(ref mut shared_job) = shared_job_lock.deref_mut() {
-            // If a shared job already exists, increase it's age.
-            shared_job.age += 1;
-        } else {
+        let shared_job = &*self.thread_info().shared_job;
+        if let Some(mut shared_job_lock) = shared_job.job_ref.lock_if_none() {
             // No shared job exists, so pop the oldest task off the back of the
             // stack and share it.
-            *shared_job_lock = Some(SharedJob {
-                job_ref: job_queue.pop_back().unwrap(),
-                age: 1, // Starts at 1 so that we can use 0 default in `claim_shared`.
-            });
+            *shared_job_lock = Some(job_queue.pop_back().unwrap());
+            shared_job.age.store(1, Ordering::Relaxed);
+        } else {
+            // If a shared job already exists, increase it's age.
+            shared_job.age.fetch_add(1, Ordering::Relaxed);
         }
         // Attempt to wake one other thread to claim this shared job.
         self.registry.wake_any(1);
