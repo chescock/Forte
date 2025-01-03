@@ -25,6 +25,7 @@
 pub mod job;
 pub mod latch;
 pub mod scope;
+pub mod tagged_atomic_box;
 pub mod thread_pool;
 
 mod util;

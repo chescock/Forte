@@ -4,11 +4,13 @@ use std::{
     future::Future,
     mem,
     num::NonZero,
-    ops::{Deref, DerefMut},
+    ops::Deref,
     pin::Pin,
     ptr::{self, NonNull},
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        Arc,
+    },
     task::{Context, Poll},
     thread::{self, JoinHandle},
     time::Duration,
@@ -23,6 +25,7 @@ use crate::{
     job::{HeapJob, JobRef, StackJob},
     latch::{AtomicLatch, Latch, LockLatch, Probe, RegistryLatch, SetOnWake, WakeLatch, WakeProbe},
     scope::*,
+    tagged_atomic_box::TaggedAtomicBox,
     util::CallOnDrop,
 };
 
@@ -161,13 +164,13 @@ struct ThreadInfo {
     /// periodically by a coordination thread. The heartbeat is used to
     /// "promote" local jobs to shared jobs.
     heartbeat: CachePadded<AtomicBool>,
-    /// Each worker may "share" one job, allowing other workers to claim it if
-    /// they are busy. This is typically the last (oldest) job on their queue.
+    /// Each worker may "share" a queue of jobs, allowing other workers to claim them if
+    /// they are busy. This is typically the last (oldest) jobs on their queue.
     ///
-    /// To reduce global lock contention, these shared jobs are stored behind
-    /// individual mutex lock. We should try to keep contention on the shared
+    /// To reduce global lock contention, these shared job queues are stored behind
+    /// atomic pointers to boxes. We should try to keep contention on the shared
     /// job locks as low as possible.
-    shared_job: CachePadded<Mutex<Option<SharedJob>>>,
+    shared_job: CachePadded<SharedJob>,
     /// Blocking synchronization data for the thread.
     sleep_state: CachePadded<SleepState>,
     /// A latch that terminates the worker thread when set.
@@ -182,15 +185,16 @@ struct SleepState {
     should_wake: Condvar,
 }
 
-/// This represents a job that may be claimed by any worker, but currently is
+/// This represents a set of jobs that may be claimed by any worker, but currently are
 /// assigned to a specific worker.
+#[derive(Default)]
 struct SharedJob {
-    /// When a shared job is created, this number is set to zero and increments
+    /// When a shared job queue is created, this number is set to zero and increments
     /// each time a worker receives a heartbeat. This allows workers to
-    /// prioritize older jobs when looking for shared jobs to claim.
-    age: u64,
-    /// The reference to the job.
-    job_ref: JobRef,
+    /// prioritize older jobs when looking for shared job queues to claim.
+    age: AtomicU64,
+    /// The reference to the jobs.
+    queue: TaggedAtomicBox<VecDeque<JobRef>>,
 }
 
 // -----------------------------------------------------------------------------
@@ -434,7 +438,7 @@ impl ThreadInfo {
     fn new(index: usize) -> ThreadInfo {
         ThreadInfo {
             heartbeat: CachePadded::new(AtomicBool::new(false)),
-            shared_job: CachePadded::new(Mutex::new(None)),
+            shared_job: CachePadded::new(SharedJob::default()),
             sleep_state: CachePadded::new(SleepState {
                 is_blocked: Mutex::new(false),
                 should_wake: Condvar::new(),
@@ -713,6 +717,13 @@ impl Registry {
 /// Data for a local worker thread, typically stored in a thread-local static.
 pub struct WorkerThread {
     job_queue: UnsafeCell<VecDeque<JobRef>>,
+    /// A spare empty boxed queue.
+    /// Storing an extra lets us re-use allocations when sharing jobs.
+    #[expect(
+        clippy::box_collection,
+        reason = "We are boxing to have a pointer-sized handle to use with AtomicPtr<T>"
+    )]
+    spare_queue: Cell<Option<Box<VecDeque<JobRef>>>>,
     registry: Arc<Registry>,
     index: usize,
 }
@@ -798,65 +809,84 @@ impl WorkerThread {
         job_queue.pop_front()
     }
 
-    /// Claims a shared job. Will try to reclaim the worker's shared job first,
+    /// Moves the jobs from the given queue into the local queue,
+    /// and tries to pop one.
+    fn steal_from(&self, queue: &TaggedAtomicBox<VecDeque<JobRef>>) -> Option<JobRef> {
+        // SAFETY: The job queue reference is not returned, and `job_queue` is
+        // not called again within this scope.
+        let job_queue = unsafe { self.job_queue() };
+        // Steal the shared queue, leaving our empty spare in its place.
+        let empty_queue = self.spare_queue.take().unwrap_or_default();
+        let mut stolen_queue = queue.swap(empty_queue, true);
+        // Fill our local queue with the stolen one by swapping the queue itself out of the box.
+        mem::swap(job_queue, &mut *stolen_queue);
+        // Put the stolen box with our original empty queue back as our empty spare.
+        debug_assert!(stolen_queue.is_empty());
+        self.spare_queue.set(Some(stolen_queue));
+        // Try to pop.
+        // Even if the caller checked `!queue.is_empty()`, it may have been replaced
+        // with an empty queue between the check and the `swap` call.
+        job_queue.pop_front()
+    }
+
+    /// Claims a shared job queue. Will try to reclaim the worker's shared job queue first,
     /// and then will try to claim the oldest job.
-    ///
-    /// Only the "owner" of the shared job is allowed to hard-lock on it. Other
-    /// threads always use `try_lock` and skip if not
     #[inline]
     pub fn claim_shared(&self) -> Option<JobRef> {
-        // Try to reclaim this worker's own shared job first.
-        if let Some(shared_job) = mem::take(self.thread_info().shared_job.lock().deref_mut()) {
-            return Some(shared_job.job_ref);
-        }
-
-        // If that doesn't work, we will try to find the oldest job shared by a
-        // different worker and claim that. We will store a lock on the oldest
-        // job we have found along with it's age.
-        let mut candidate_job_lock = None;
-        // Shared job age starts at 1, so setting this to 0 initially means we
-        // will take the first job we find.
-        let mut candidate_age = 0;
-
-        // We will iterate over all threads in index order, starting with the
-        // next thread. We do this as an alternative to starting with thread 0
-        // to reduce lock contention in the event that multiple threads wake
-        // simultaneously.
-        let current_thread = self.index();
-        let num_threads = self.registry.num_threads();
-        for i in 0..num_threads {
-            let i = (current_thread + 1 + i) % num_threads;
-            let thread = &self.registry.threads[i];
-
-            // Now we will try to acquire a lock on the next shared job. At this
-            // point, it's possible we already hold a lock on another shared job
-            // (the candidate). To avoid deadlocks, we will simply skip shared
-            // jobs that are already locked.
-            if let Some(new_job_lock) = thread.shared_job.try_lock() {
-                // Promote the new job to the candidate if it's older.
-                if let Some(new_job) = new_job_lock.deref() {
-                    if new_job.age > candidate_age {
-                        candidate_age = new_job.age;
-                        // This releases the lock on the previous best job and
-                        // replaces it with the lock on the new best job.
-                        candidate_job_lock = Some(new_job_lock);
-                    }
-                }
+        // Try to reclaim this worker's own shared job queue first.
+        let local_queue = &self.thread_info().shared_job.queue;
+        // Check that the queue is empty first to be friendlier to caches.
+        // The swap would take exclusive access even if the queue was empty.
+        if !local_queue.is_empty() {
+            if let Some(job_ref) = self.steal_from(local_queue) {
+                return Some(job_ref);
             }
         }
 
-        // If we have a locked job candidate, take it.
-        if let Some(mut job_lock) = candidate_job_lock {
-            let shared = mem::take(job_lock.deref_mut());
-            return Some(shared.unwrap().job_ref);
-        }
+        loop {
+            // If that doesn't work, we will try to find the oldest job queue shared by a
+            // different worker and claim that. We will store a reference to the oldest
+            // job queue we have found along with it's age.
+            let mut candidate_queue = None;
+            // Shared job queue age starts at 1, so setting this to 0 initially means we
+            // will take the first job queue we find.
+            let mut candidate_age = 0;
 
-        None
+            // We will iterate over all threads in index order, starting with the
+            // next thread. We do this as an alternative to starting with thread 0
+            // to reduce lock contention in the event that multiple threads wake
+            // simultaneously.
+            let current_thread = self.index();
+            let num_threads = self.registry.num_threads();
+            for i in 0..num_threads {
+                let i = (current_thread + 1 + i) % num_threads;
+                let new_job = &*self.registry.threads[i].shared_job;
+
+                // Promote the new job queue to the candidate if it's older and isn't empty.
+                // We use `is_empty` to check without performing any writes to shared memory.
+                // This means it may get claimed by another thread before we decide to take it.
+                let new_age = new_job.age.load(Ordering::Relaxed);
+                if new_age > candidate_age && !new_job.queue.is_empty() {
+                    candidate_age = new_age;
+                    candidate_queue = Some(&new_job.queue);
+                }
+            }
+
+            // Stop if we found nothing to claim.
+            let candidate_queue = candidate_queue?;
+
+            // Try to claim the other job queue.
+            // If another thread claimed the queue after we checked,
+            // this will fail and we'll loop.
+            if let Some(job_ref) = self.steal_from(candidate_queue) {
+                return Some(job_ref);
+            }
+        }
     }
 
-    /// Pops a job off the local queue and promotes it to a shared job. If the
+    /// Pops jobs off the local queue and promotes them to a shared job queue. If the
     /// local job queue is empty, this does nothing. If the worker has an
-    /// existing shared job, it increment that job's age.
+    /// existing shared job queue, it increment that job queue's age.
     #[cold]
     fn promote(&self) {
         // SAFETY: The job queue reference is not returned, and `job_queue` is
@@ -865,18 +895,33 @@ impl WorkerThread {
         if job_queue.is_empty() {
             return;
         }
-        // Acquire the lock on the shared job
-        let mut shared_job_lock = self.thread_info().shared_job.lock();
-        if let Some(ref mut shared_job) = shared_job_lock.deref_mut() {
-            // If a shared job already exists, increase it's age.
-            shared_job.age += 1;
+        let shared_job = &*self.thread_info().shared_job;
+        if !shared_job.queue.is_empty() {
+            // If a shared job queue already exists, increase it's age.
+            shared_job.age.fetch_add(1, Ordering::Relaxed);
         } else {
-            // No shared job exists, so pop the oldest task off the back of the
-            // stack and share it.
-            *shared_job_lock = Some(SharedJob {
-                job_ref: job_queue.pop_back().unwrap(),
-                age: 1, // Starts at 1 so that we can use 0 default in `claim_shared`.
-            });
+            // No shared job queue exists, so pop the oldest tasks off the back of the
+            // stack and share them.
+
+            // Use our empty spare as the allocation for the new queue to share.
+            let mut shared_queue = self.spare_queue.take().unwrap_or_default();
+
+            // Copy the oldest half of our local queue to the shared queue.
+            // Round up so that we can share a single job.
+            let count = (job_queue.len() + 1) / 2;
+            shared_queue.reserve(count);
+            for _ in 0..count {
+                shared_queue.push_front(job_queue.pop_back().unwrap());
+            }
+
+            // Age starts at 1 so that we can use 0 default in `claim_shared`.
+            shared_job.age.store(1, Ordering::Relaxed);
+            // Share the new queue, obtaining an empty queue to use as our empty spare.
+            // The shared job is only set to a non-empty queue by the current thread,
+            // and it was empty earlier, so we know that it's still empty.
+            let empty_queue = shared_job.queue.swap(shared_queue, false);
+            debug_assert!(empty_queue.is_empty());
+            self.spare_queue.set(Some(empty_queue));
         }
         // Attempt to wake one other thread to claim this shared job.
         self.registry.wake_any(1);
@@ -995,6 +1040,7 @@ unsafe fn main_loop(registry: Arc<Registry>, index: usize) {
         index,
         registry: registry.clone(),
         job_queue: UnsafeCell::new(VecDeque::with_capacity(32)),
+        spare_queue: Cell::new(Some(Box::new(VecDeque::with_capacity(32)))),
     };
 
     // SAFETY: This function is the only thing that has been run on this thread,
