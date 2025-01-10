@@ -54,15 +54,17 @@ fn main() {
     for i in 1..1000 {
         let main_thread_proxy = event_loop.create_proxy();
         COMPUTE.spawn(move || {
-            // SAFTEY: This is executed on the thread pool so the worker thread must be non-null.
-            let thread = unsafe { &*WorkerThread::current() };
+            WorkerThread::with(|thread| {
+                // This is executed on the thread pool so the worker thread must be non-null.
+                let thread = thread.unwrap();
 
-            println!("Thread {} says {}", thread.index(), i);
+                println!("Thread {} says {}", thread.index(), i);
 
-            // Manually construct and send a job to the main thread
-            let main_thread_job = HeapJob::new(move || println!("Main thread says {}", i));
-            let job_ref = main_thread_job.into_static_job_ref();
-            main_thread_proxy.send_event(job_ref);
+                // Manually construct and send a job to the main thread
+                let main_thread_job = HeapJob::new(move || println!("Main thread says {}", i));
+                let job_ref = main_thread_job.into_static_job_ref();
+                main_thread_proxy.send_event(job_ref);
+            });
         });
     }
 

@@ -1,9 +1,9 @@
 use std::{
-    cell::{Cell, UnsafeCell},
+    cell::{OnceCell, UnsafeCell},
     collections::VecDeque,
     future::Future,
     pin::Pin,
-    ptr::{self, NonNull},
+    ptr::NonNull,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     sync::Arc,
     task::{Context, Poll},
@@ -259,7 +259,7 @@ impl ThreadPool {
     {
         // We cannot shrink the pool from within the pool, so we simply refuse
         // the request and return the same size.
-        if !WorkerThread::current().is_null() {
+        if WorkerThread::with(|worker_thread| worker_thread.is_some()) {
             return self.state.running_threads.load(Ordering::Acquire);
         }
 
@@ -349,16 +349,12 @@ impl ThreadPool {
     /// When called on a worker thread, this pushes the job directly into the
     /// local queue. Otherwise it injects it into the thread pool queue.
     pub fn inject_or_push(&'static self, job_ref: JobRef) {
-        let worker_thread = WorkerThread::current();
-        // SAFETY: We check if the worker thread is null and only dereference it
-        // if we find that it is not.
-        unsafe {
-            if !worker_thread.is_null() && (*worker_thread).thread_pool().id() == self.id() {
-                (*worker_thread).push(job_ref);
-            } else {
-                self.inject(job_ref);
+        WorkerThread::with(|worker_thread| match worker_thread {
+            Some(worker_thread) if worker_thread.thread_pool().id() == self.id() => {
+                worker_thread.push(job_ref)
             }
-        }
+            _ => self.inject(job_ref),
+        })
     }
 
     /// Injects a job into the thread pool.
@@ -389,25 +385,23 @@ impl ThreadPool {
         F: FnOnce(&WorkerThread, bool) -> T + Send,
         T: Send,
     {
-        // If we are not in a worker, pack the function into a job and send it
-        // to the global injector queue. This will block until the job completes.
-        let worker_thread = WorkerThread::current();
-        if worker_thread.is_null() {
-            return self.in_worker_cold(f);
-        }
-
-        // SAFETY: We just checked that this pointer wasn't null.
-        let worker_thread = unsafe { &*worker_thread };
-        if worker_thread.thread_pool.id() != self.id() {
-            // We are in a worker thread, but not in the same thread pool.
-            // Package the job into a thread but then do idle work until it
-            // completes.
-            self.in_worker_cross(worker_thread, f)
-        } else {
-            // We are in a worker thread for the correct thread pool, so we can
-            // just execute the function directly.
-            f(worker_thread, false)
-        }
+        WorkerThread::with(|worker_thread| match worker_thread {
+            // If we are not in a worker, pack the function into a job and send it
+            // to the global injector queue. This will block until the job completes.
+            None => self.in_worker_cold(f),
+            Some(worker_thread) => {
+                if worker_thread.thread_pool.id() != self.id() {
+                    // We are in a worker thread, but not in the same thread pool.
+                    // Package the job into a thread but then do idle work until it
+                    // completes.
+                    self.in_worker_cross(worker_thread, f)
+                } else {
+                    // We are in a worker thread for the correct thread pool, so we can
+                    // just execute the function directly.
+                    f(worker_thread, false)
+                }
+            }
+        })
     }
 
     /// Queues the provided closure for execution on a worker and then blocks
@@ -430,16 +424,18 @@ impl ThreadPool {
         LOCK_LATCH.with(|latch| {
             let mut result = None;
             let job = StackJob::new(|| {
-                // SAFETY: Since this is within a job, and jobs only execute on
-                // worker threads, this must be non-null.
-                let worker_thread = unsafe { &*WorkerThread::current() };
+                WorkerThread::with(|worker_thread| {
+                    // Since this is within a job, and jobs only execute on
+                    // worker threads, this must be non-null.
+                    let worker_thread = worker_thread.unwrap();
 
-                // Run the user-provided function and write the output directly
-                // to the result.
-                result = Some(f(worker_thread, true));
+                    // Run the user-provided function and write the output directly
+                    // to the result.
+                    result = Some(f(worker_thread, true));
 
-                // SAFETY: This latch is static, so the pointer is always valid.
-                unsafe { Latch::set(latch) };
+                    // SAFETY: This latch is static, so the pointer is always valid.
+                    unsafe { Latch::set(latch) };
+                });
             });
 
             // Inject the job into the thread pool for execution.
@@ -476,15 +472,17 @@ impl ThreadPool {
         let latch = WakeLatch::new(current_thread);
         let mut result = None;
         let job = StackJob::new(|| {
-            // SAFETY: Jobs are only executed on worker threads, so this must be
-            // non-null.
-            let worker_thread = unsafe { &*WorkerThread::current() };
+            WorkerThread::with(|worker_thread| {
+                // Jobs are only executed on worker threads, so this must be
+                // non-null.
+                let worker_thread = worker_thread.unwrap();
 
-            result = Some(f(worker_thread, true));
+                result = Some(f(worker_thread, true));
 
-            // SAFETY: This latch is valid until this function returns, and it
-            // does not return until the latch is set.
-            unsafe { Latch::set(&latch) };
+                // SAFETY: This latch is valid until this function returns, and it
+                // does not return until the latch is set.
+                unsafe { Latch::set(&latch) };
+            })
         });
 
         // SAFETY: This job is valid for this entire scope. The scope does not
@@ -903,7 +901,7 @@ pub struct WorkerThread {
 }
 
 thread_local! {
-    static WORKER_THREAD_STATE: Cell<*const WorkerThread> = const { Cell::new(ptr::null()) };
+    static WORKER_THREAD_STATE: CachePadded<OnceCell<WorkerThread>> = const { CachePadded::new(OnceCell::new()) };
 }
 
 impl WorkerThread {
@@ -927,25 +925,10 @@ impl WorkerThread {
         &mut *self.queue.get()
     }
 
-    /// Sets `self` as the worker thread index for the current thread.
-    /// This is done during worker thread startup.
-    ///
-    /// # Safety
-    ///
-    /// This must be called only once per thread.
-    unsafe fn set_current(&self) {
-        WORKER_THREAD_STATE.with(|t| {
-            assert!(t.get().is_null());
-            t.set(self);
-        });
-    }
-
-    /// Gets the `WorkerThread` for the current thread; returns NULL if this is
-    /// not a worker thread. This pointer is valid anywhere on the current
-    /// thread.
-    #[inline]
-    pub fn current() -> *const WorkerThread {
-        WORKER_THREAD_STATE.with(Cell::get)
+    /// Acquires a reference to the `WorkerThread` for the current thread.
+    /// This will be `None` if the current thread is not a worker thread.
+    pub fn with<R>(f: impl FnOnce(Option<&Self>) -> R) -> R {
+        WORKER_THREAD_STATE.with(|worker_thread| f(worker_thread.get()))
     }
 
     /// Returns the thread pool to which the worker belongs.
@@ -1142,40 +1125,36 @@ unsafe fn main_loop(thread_pool: &'static ThreadPool, index: usize) {
     // Store a reference to this thread's control data.
     let control = &thread_pool.threads[index].control;
     
-    // Register the worker on the thread.
-    let worker_thread = WorkerThread {
-        index,
-        thread_pool,
-        queue: UnsafeCell::new(VecDeque::with_capacity(32)),
-        rng: XorShift64Star::new(index as u64 + 1),
-    };
+    WORKER_THREAD_STATE.with(|worker_thread| {
+        // Register the worker on the thread.
+        let worker_thread = worker_thread.get_or_init(|| WorkerThread {
+            index,
+            thread_pool,
+            queue: UnsafeCell::new(VecDeque::with_capacity(32)),
+            rng: XorShift64Star::new(index as u64 + 1),
+        });
 
-    // SAFETY: This function is the only thing that has been run on this thread,
-    // so this will be called only once.
-    unsafe {
-        worker_thread.set_current();
-    }
+        // Inform other threads that we are starting the main worker loop.
+        control.post_ready_status();
 
-    // Inform other threads that we are starting the main worker loop.
-    control.post_ready_status();
+        // Run the worker thread until the thread is asked to terminate.
+        worker_thread.run_until(&control.should_terminate);
 
-    // Run the worker thread until the thread is asked to terminate.
-    worker_thread.run_until(&control.should_terminate);
+        // Offload any remaining local work into the global queue.
+        // SAFETY: We don't call `get_queue` ever again on this thread.
+        let local_queue = unsafe { worker_thread.get_queue() };
+        for job in local_queue.drain(..) {
+            thread_pool.inject(job);
+        }
 
-    // Offload any remaining local work into the global queue.
-    // SAFETY: We don't call `get_queue` ever again on this thread.
-    let local_queue = unsafe { worker_thread.get_queue() };
-    for job in local_queue.drain(..) {
-        thread_pool.inject(job);
-    }
+        // If we had a shared job, push that to the global queue after all the local queue is pushed.
+        if let Some(job) = worker_thread.thread_info().shared_job.take() {
+            thread_pool.inject(job);
+        }
 
-    // If we had a shared job, push that to the global queue after all the local queue is pushed.
-    if let Some(job) = worker_thread.thread_info().shared_job.take() {
-        thread_pool.inject(job);
-    }
-
-    // Inform other threads that we are terminating.
-    control.post_termination_status();
+        // Inform other threads that we are terminating.
+        control.post_termination_status();
+    });
 }
 
 // -----------------------------------------------------------------------------
