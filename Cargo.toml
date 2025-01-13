@@ -2,6 +2,9 @@
 name = "forte"
 version = "0.1.0"
 edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "A low-overhead thread-pool with support for non-static async closures"
+repository = "https://github.com/NthTensor/Forte"
 
 [dependencies]
 parking_lot = "0.12.3"
